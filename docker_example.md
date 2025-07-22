@@ -399,7 +399,7 @@ Docker Compose devient utile quand vous avez :
 - **Plusieurs volumes à gérer**
 - **Configuration réseau spécifique**
 
-**Exemple : Vue.js + API Node.js + PostgreSQL**
+**Exemple : Vue.js + API Node.js + PostgreSQL + Migrate**
 
 ```yaml
 # docker-compose.yml
@@ -435,7 +435,10 @@ services:
       - NODE_ENV=development
       - DATABASE_URL=postgresql://user:password@database:5432/myapp
     depends_on:
-      - database
+      database:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # Base de données PostgreSQL
   database:
@@ -446,9 +449,31 @@ services:
       POSTGRES_PASSWORD: password
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d myapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Service de migration avec migrate
+  migrate:
+    image: migrate/migrate:v4.16.2
+    volumes:
+      - ./migrations:/migrations
+    environment:
+      - DATABASE_URL=postgresql://user:password@database:5432/myapp?sslmode=disable
+    command: [
+      "-path", "/migrations",
+      "-database", "postgresql://user:password@database:5432/myapp?sslmode=disable",
+      "up"
+    ]
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: "no"
 
 volumes:
   postgres_data:
@@ -497,45 +522,149 @@ docker-compose up --build
 | ✅ Un seul conteneur | ✅ Base de données |
 | ✅ Prototype | ✅ Production |
 
-### Configuration PostgreSQL avancée
+### Gestion des migrations avec Migrate
 
-**Variables d'environnement PostgreSQL :**
+**Structure du projet avec migrations :**
 
-```yaml
-database:
-  image: postgres:15-alpine
-  environment:
-    POSTGRES_DB: myapp
-    POSTGRES_USER: user
-    POSTGRES_PASSWORD: password
-    POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
-  volumes:
-    - postgres_data:/var/lib/postgresql/data
-    - ./postgres-init:/docker-entrypoint-initdb.d
-  ports:
-    - "5432:5432"
-  healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U user -d myapp"]
-    interval: 10s
-    timeout: 5s
-    retries: 5
+```
+projet/
+├── frontend/
+│   ├── Dockerfile
+│   └── ... (fichiers Vue.js)
+├── backend/
+│   ├── Dockerfile
+│   └── ... (fichiers API)
+├── migrations/
+│   ├── 000001_create_users_table.up.sql
+│   ├── 000001_create_users_table.down.sql
+│   ├── 000002_add_posts_table.up.sql
+│   └── 000002_add_posts_table.down.sql
+└── docker-compose.yml
 ```
 
-**Script d'initialisation (postgres-init/01-init.sql) :**
+**Exemples de fichiers de migration :**
 
+**migrations/000001_create_users_table.up.sql :**
 ```sql
--- Création des tables
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Insertion de données de test
-INSERT INTO users (email, name) VALUES 
-    ('john@example.com', 'John Doe'),
-    ('jane@example.com', 'Jane Smith');
+-- Index sur l'email pour les performances
+CREATE INDEX idx_users_email ON users(email);
+```
+
+**migrations/000001_create_users_table.down.sql :**
+```sql
+DROP INDEX IF EXISTS idx_users_email;
+DROP TABLE IF EXISTS users;
+```
+
+**migrations/000002_add_posts_table.up.sql :**
+```sql
+CREATE TABLE IF NOT EXISTS posts (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    content TEXT,
+    published BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index sur user_id pour les performances
+CREATE INDEX idx_posts_user_id ON posts(user_id);
+CREATE INDEX idx_posts_published ON posts(published);
+```
+
+**migrations/000002_add_posts_table.down.sql :**
+```sql
+DROP INDEX IF EXISTS idx_posts_published;
+DROP INDEX IF EXISTS idx_posts_user_id;
+DROP TABLE IF EXISTS posts;
+```
+
+**Commandes utiles pour les migrations :**
+
+```bash
+# Lancer toute la stack (migrations incluses)
+docker-compose up -d
+
+# Voir les logs des migrations
+docker-compose logs migrate
+
+# Créer une nouvelle migration (depuis le host)
+migrate create -ext sql -dir migrations -seq add_comments_table
+
+# Appliquer manuellement les migrations
+docker-compose run --rm migrate -path /migrations -database "postgresql://user:password@database:5432/myapp?sslmode=disable" up
+
+# Revenir en arrière d'une migration
+docker-compose run --rm migrate -path /migrations -database "postgresql://user:password@database:5432/myapp?sslmode=disable" down 1
+
+# Vérifier la version actuelle
+docker-compose run --rm migrate -path /migrations -database "postgresql://user:password@database:5432/myapp?sslmode=disable" version
+
+# Forcer une version spécifique
+docker-compose run --rm migrate -path /migrations -database "postgresql://user:password@database:5432/myapp?sslmode=disable" force 2
+```
+
+**Alternative : Service de migration personnalisé**
+
+Si vous préférez plus de contrôle, vous pouvez créer votre propre service de migration :
+
+```yaml
+# Service de migration personnalisé
+migrate:
+  build:
+    context: ./migrate-service
+    dockerfile: Dockerfile
+  volumes:
+    - ./migrations:/migrations
+  environment:
+    - DATABASE_URL=postgresql://user:password@database:5432/myapp?sslmode=disable
+  depends_on:
+    database:
+      condition: service_healthy
+  restart: "no"
+```
+
+**migrate-service/Dockerfile :**
+```dockerfile
+FROM migrate/migrate:v4.16.2
+
+# Installer des outils supplémentaires si nécessaire
+RUN apk add --no-cache postgresql-client
+
+# Script personnalisé de migration
+COPY migrate.sh /migrate.sh
+RUN chmod +x /migrate.sh
+
+ENTRYPOINT ["/migrate.sh"]
+```
+
+**migrate-service/migrate.sh :**
+```bash
+#!/bin/sh
+set -e
+
+echo "🔄 Début des migrations..."
+
+# Attendre que la base soit prête
+until pg_isready -h database -p 5432 -U user; do
+  echo "⏳ En attente de PostgreSQL..."
+  sleep 2
+done
+
+# Appliquer les migrations
+migrate -path /migrations -database "$DATABASE_URL" up
+
+echo "✅ Migrations terminées avec succès!"
 ```
 
 ## Conclusion
